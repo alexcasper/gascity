@@ -62,6 +62,16 @@ func stageFiles(ctx context.Context, ops k8sOps, podName string, cfg runtime.Con
 			[]string{"sh", "-c", "cp -a /workspace/.gc /city-stage/.gc 2>/dev/null || true"}, nil)
 	}
 
+	// Copy extra packs from the controller's city that are not embedded in
+	// the gc binary's default set (bd, core, dolt, gastown, maintenance).
+	// Extra packs (e.g. discord) are installed separately and must be staged
+	// into agent pods so gc init can resolve imports.
+	if ctrlCity != "" {
+		if err := stageExtraPacks(ctx, ops, podName, ctrlCity, warn); err != nil {
+			fmt.Fprintf(warn, "gc: warning: staging extra packs: %v\n", err) //nolint:errcheck
+		}
+	}
+
 	// Signal init container to exit.
 	_, err := ops.execInPod(ctx, podName, "stage",
 		[]string{"touch", "/workspace/.gc-ready"}, nil)
@@ -308,4 +318,45 @@ func tarFile(path string, info os.FileInfo, name string, w io.Writer) error {
 	defer func() { _ = f.Close() }()
 	_, err = io.Copy(tw, f)
 	return err
+}
+
+// embeddedPacks lists pack names embedded in the gc binary's default init.
+// Packs outside this set are "extra" and must be staged into agent pods.
+var embeddedPacks = map[string]bool{
+	"bd": true, "core": true, "dolt": true, "gastown": true, "maintenance": true,
+}
+
+// stageExtraPacks copies packs from the controller's city that are not
+// part of the gc binary's embedded defaults into the agent pod's workspace.
+func stageExtraPacks(ctx context.Context, ops k8sOps, podName, ctrlCity string, warn io.Writer) error {
+	packsDir := filepath.Join(ctrlCity, ".gc", "system", "packs")
+	entries, err := os.ReadDir(packsDir)
+	if err != nil {
+		return nil // no packs directory — nothing to stage
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if embeddedPacks[name] {
+			continue
+		}
+
+		src := filepath.Join(packsDir, name)
+		dst := "/workspace/.gc/system/packs/" + name
+
+		// Check if the pack already exists in the pod (from image).
+		if _, err := ops.execInPod(ctx, podName, "stage",
+			[]string{"test", "-d", dst}, nil); err == nil {
+			continue // already present
+		}
+
+		fmt.Fprintf(warn, "gc: staging extra pack %s\n", name) //nolint:errcheck
+		if err := copyDirToPod(ctx, ops, podName, "stage", src, dst); err != nil {
+			fmt.Fprintf(warn, "gc: warning: failed to stage extra pack %s: %v\n", name, err) //nolint:errcheck
+		}
+	}
+	return nil
 }
